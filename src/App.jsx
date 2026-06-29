@@ -237,41 +237,48 @@ function Tracker({ config, onDisconnect, t }) {
 
       const entries = Object.entries(travelers);
       if (!entries.length) { shares["Ahmad"] = (shares["Ahmad"] || 0) + fuelCost; return; }
-      const totalW = entries.reduce((s, [, m]) => s + (m === "one" ? 0.5 : 1), 0);
 
+      // Per-leg split: going leg = everyone, return leg = only "both" travelers
+      const goingTravelers = entries.map(([p]) => p);
+      const returnTravelers = entries.filter(([, m]) => m === "both").map(([p]) => p);
+
+      let sharedCost, personalCost;
       if (trip.mode === "estimate") {
-        // Estimate mode: split sharedCost by weight, rest to Ahmad
-        const sharedCost = trip.sharedCost || 0;
-        const personalCost = fuelCost - sharedCost;
-
-        entries.forEach(([p, mode]) => {
-          const w = mode === "one" ? 0.5 : 1;
-          if (shares[p] === undefined) shares[p] = 0;
-          shares[p] += (w / totalW) * sharedCost;
-        });
-
-        if (personalCost > 0) {
-          if (shares["Ahmad"] === undefined) shares["Ahmad"] = 0;
-          shares["Ahmad"] += personalCost;
-        }
+        sharedCost = trip.sharedCost || 0;
+        personalCost = fuelCost - sharedCost;
       } else {
-        // Exact mode: km-based split
         const { totalKm, sharedKm } = trip;
         if (!totalKm) return;
         const perKmCost = fuelCost / totalKm;
         const effectiveSharedKm = Math.min(sharedKm, totalKm);
-        const personalKm = totalKm - effectiveSharedKm;
+        sharedCost = effectiveSharedKm * perKmCost;
+        personalCost = (totalKm - effectiveSharedKm) * perKmCost;
+      }
 
-        entries.forEach(([p, mode]) => {
-          const w = mode === "one" ? 0.5 : 1;
+      const halfCost = sharedCost / 2;
+
+      // Going leg: split among all travelers
+      goingTravelers.forEach((p) => {
+        if (shares[p] === undefined) shares[p] = 0;
+        shares[p] += halfCost / goingTravelers.length;
+      });
+
+      // Return leg: split among both-way travelers only
+      if (returnTravelers.length > 0) {
+        returnTravelers.forEach((p) => {
           if (shares[p] === undefined) shares[p] = 0;
-          shares[p] += (w / totalW) * effectiveSharedKm * perKmCost;
+          shares[p] += halfCost / returnTravelers.length;
         });
+      } else {
+        // No one going back? Return leg cost goes to Ahmad
+        if (shares["Ahmad"] === undefined) shares["Ahmad"] = 0;
+        shares["Ahmad"] += halfCost;
+      }
 
-        if (personalKm > 0) {
-          if (shares["Ahmad"] === undefined) shares["Ahmad"] = 0;
-          shares["Ahmad"] += personalKm * perKmCost;
-        }
+      // Personal cost to Ahmad
+      if (personalCost > 0) {
+        if (shares["Ahmad"] === undefined) shares["Ahmad"] = 0;
+        shares["Ahmad"] += personalCost;
       }
     });
 
@@ -433,7 +440,6 @@ function Tracker({ config, onDisconnect, t }) {
             : month.trips.map((trip) => {
               const isEst = trip.mode === "estimate";
               const te = Object.entries(trip.travelers);
-              const tw = te.reduce((s, [, m]) => s + (m === "one" ? 0.5 : 1), 0);
 
               let perKm, sharedKm, personalKm, sharedCost, personalCost;
               if (isEst) {
@@ -468,16 +474,19 @@ function Tracker({ config, onDisconnect, t }) {
                   {isEst && personalCost > 0 && <div style={{ fontSize: 12, color: "#f59e0b", marginTop: 6, fontWeight: 500 }}>Personal: {formatRs(personalCost)}</div>}
                   {!isEst && personalKm > 0 && <div style={{ fontSize: 12, color: "#f59e0b", marginTop: 6, fontWeight: 500 }}>Personal: {personalKm} km ({formatRs(personalKm * perKm)})</div>}
                   <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
-                    {te.map(([p, mode]) => {
-                      const w = mode === "one" ? 0.5 : 1;
-                      let share;
-                      if (isEst) {
-                        share = (w / tw) * sharedCost + (p === "Ahmad" && personalCost > 0 ? personalCost : 0);
-                      } else {
-                        share = (w / tw) * sharedKm * perKm + (p === "Ahmad" ? personalKm * perKm : 0);
-                      }
-                      return <span key={p} style={{ fontSize: 12, background: t.card, border: `1px solid ${t.border}`, borderRadius: 6, padding: "3px 8px", fontWeight: 500 }}>{p}: {formatRs(share)}</span>;
-                    })}
+                    {(() => {
+                      const going = te.map(([p]) => p);
+                      const returning = te.filter(([, m]) => m === "both").map(([p]) => p);
+                      const sc = isEst ? sharedCost : sharedKm * perKm;
+                      const pc = isEst ? personalCost : personalKm * perKm;
+                      const half = sc / 2;
+                      return te.map(([p, mode]) => {
+                        let share = half / going.length;
+                        if (mode === "both" && returning.length > 0) share += half / returning.length;
+                        if (p === "Ahmad") share += (pc || 0);
+                        return <span key={p} style={{ fontSize: 12, background: t.card, border: `1px solid ${t.border}`, borderRadius: 6, padding: "3px 8px", fontWeight: 500 }}>{p}: {formatRs(share)}</span>;
+                      });
+                    })()}
                   </div>
                 </div>
               );
@@ -551,18 +560,21 @@ function Tracker({ config, onDisconnect, t }) {
             {tripForm.fuelCost && Object.keys(tripForm.travelers).length > 0 && (() => {
               const fc = parseFloat(tripForm.fuelCost);
               const entries = Object.entries(tripForm.travelers);
-              const totalW = entries.reduce((s, [, m]) => s + (m === "one" ? 0.5 : 1), 0);
 
               if (tripForm.mode === "estimate") {
                 const sc = parseFloat(tripForm.sharedCost) || 0;
                 const pc = fc - sc;
                 if (!sc) return null;
+                const going = entries.map(([p]) => p);
+                const returning = entries.filter(([, m]) => m === "both").map(([p]) => p);
+                const half = sc / 2;
                 return (
                   <div style={{ background: t.bg, border: `1px solid ${t.border}`, borderRadius: 8, padding: 12, marginBottom: 16 }}>
                     <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: t.textSec, marginBottom: 8 }}>Split Preview</div>
                     {entries.map(([p, mode]) => {
-                      const w = mode === "one" ? 0.5 : 1;
-                      const share = (w / totalW) * sc + (p === "Ahmad" && pc > 0 ? pc : 0);
+                      let share = half / going.length;
+                      if (mode === "both" && returning.length > 0) share += half / returning.length;
+                      if (p === "Ahmad") share += Math.max(0, pc);
                       return <div key={p} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "3px 0" }}><span>{p} {mode === "one" ? "(1-way)" : ""}</span><span style={{ fontWeight: 600 }}>{formatRs(share)}</span></div>;
                     })}
                     {pc > 0 && <div style={{ fontSize: 12, color: "#f59e0b", marginTop: 4 }}>Ahmad's personal: {formatRs(pc)}</div>}
@@ -573,12 +585,16 @@ function Tracker({ config, onDisconnect, t }) {
                 if (!tk) return null;
                 const sk = Math.min(parseFloat(tripForm.sharedKm) || DEFAULT_SHARED_KM, tk);
                 const pk = tk - sk, perKm = fc / tk;
+                const going = entries.map(([p]) => p);
+                const returning = entries.filter(([, m]) => m === "both").map(([p]) => p);
+                const halfCost = (sk * perKm) / 2;
                 return (
                   <div style={{ background: t.bg, border: `1px solid ${t.border}`, borderRadius: 8, padding: 12, marginBottom: 16 }}>
                     <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: t.textSec, marginBottom: 8 }}>Split Preview</div>
                     {entries.map(([p, mode]) => {
-                      const w = mode === "one" ? 0.5 : 1;
-                      const share = (w / totalW) * sk * perKm + (p === "Ahmad" ? pk * perKm : 0);
+                      let share = halfCost / going.length;
+                      if (mode === "both" && returning.length > 0) share += halfCost / returning.length;
+                      if (p === "Ahmad") share += pk * perKm;
                       return <div key={p} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "3px 0" }}><span>{p} {mode === "one" ? "(1-way)" : ""}</span><span style={{ fontWeight: 600 }}>{formatRs(share)}</span></div>;
                     })}
                     {pk > 0 && <div style={{ fontSize: 12, color: "#f59e0b", marginTop: 4 }}>Ahmad's personal: {pk} km = {formatRs(pk * perKm)}</div>}
