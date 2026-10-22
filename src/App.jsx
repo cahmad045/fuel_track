@@ -43,6 +43,47 @@ function formatDate(ds) {
 }
 const emptyMonth = () => ({ preExistingBalance: 0, deposits: {}, carryForward: {}, oneWayFares: {}, trips: [] });
 
+// ── Per-leg split logic ──
+const normMode = (m) => (m === "one" ? "morning" : m); // legacy "one" = morning only
+const MODE_TAG = { both: "", morning: " (AM)", return: " (PM)" };
+
+function tripCosts(trip) {
+  const fc = trip.fuelCost || 0;
+  if (trip.mode === "estimate") {
+    const sc = Math.min(trip.sharedCost || 0, fc);
+    return { sharedCost: sc, personalCost: fc - sc };
+  }
+  const tk = trip.totalKm || 0;
+  if (!tk) return { sharedCost: 0, personalCost: fc };
+  const perKm = fc / tk;
+  const sk = Math.min(trip.sharedKm || 0, tk);
+  return { sharedCost: sk * perKm, personalCost: (tk - sk) * perKm };
+}
+
+function tripExtras(trip) {
+  // legacy single extraFare is treated as a return-leg pickup
+  return { extraAM: trip.extraFareAM || 0, extraPM: trip.extraFarePM ?? trip.extraFare ?? 0 };
+}
+
+// Each leg is its own pool: fixed contributions come off first, remainder split equally among registered riders on that leg.
+function splitTrip({ sharedCost, personalCost, travelers, extraAM = 0, extraPM = 0, owFares = {} }) {
+  const shares = {};
+  const add = (p, v) => { shares[p] = (shares[p] || 0) + v; };
+  const entries = Object.entries(travelers || {}).map(([p, m]) => [p, normMode(m)]);
+  const legCost = sharedCost / 2;
+  [["morning", extraAM], ["return", extraPM]].forEach(([leg, extra]) => {
+    const riders = entries.filter(([, m]) => m === "both" || m === leg).map(([p]) => p);
+    const fixed = entries.filter(([p, m]) => m === leg && (owFares[p] || 0) > 0).map(([p]) => p);
+    let remaining = legCost - extra;
+    fixed.forEach((p) => { add(p, owFares[p]); remaining -= owFares[p]; });
+    const equal = riders.filter((p) => !fixed.includes(p));
+    if (equal.length) equal.forEach((p) => add(p, remaining / equal.length));
+    else add("Ahmad", remaining);
+  });
+  if (personalCost > 0) add("Ahmad", personalCost);
+  return shares;
+}
+
 // ── Dark mode hook ──
 function useDark() {
   const [dark, setDark] = useState(false);
@@ -180,7 +221,7 @@ function Tracker({ config, onDisconnect, t }) {
   const [tripForm, setTripForm] = useState({
     mode: "exact", // "exact" | "estimate"
     date: new Date().toISOString().slice(0, 10),
-    totalKm: "", fuelCost: "", sharedKm: DEFAULT_SHARED_KM, sharedCost: "", extraFare: "", travelers: {},
+    totalKm: "", fuelCost: "", sharedKm: DEFAULT_SHARED_KM, sharedCost: "", extraFareAM: "", extraFarePM: "", travelers: {},
   });
   const [setupForm, setSetupForm] = useState({ preExistingBalance: 0, deposits: {}, carryForward: {}, oneWayFares: {} });
   const [newPartner, setNewPartner] = useState("");
@@ -234,112 +275,20 @@ function Tracker({ config, onDisconnect, t }) {
     oneWayFares: hasFares ? rawMonth.oneWayFares : inherited.fares,
   };
 
-  // Shared helper: compute per-person share for a trip
-  const computeShares = (sharedCost, personalCost, entries, owFares) => {
-    const result = {};
-    const oneWay = entries.filter(([, m]) => m === "one");
-    const bothWay = entries.filter(([, m]) => m === "both");
-    let oneWayTotal = 0;
-
-    oneWay.forEach(([p]) => {
-      const fare = owFares?.[p] || 0;
-      if (fare > 0) {
-        result[p] = fare;
-        oneWayTotal += fare;
-      } else {
-        const share = (sharedCost / 2) / entries.length;
-        result[p] = share;
-        oneWayTotal += share;
-      }
-    });
-
-    const remaining = sharedCost - oneWayTotal;
-    bothWay.forEach(([p]) => {
-      result[p] = (bothWay.length > 0 ? remaining / bothWay.length : 0);
-    });
-
-    if (personalCost > 0) {
-      result["Ahmad"] = (result["Ahmad"] || 0) + personalCost;
-    }
-    return result;
-  };
-
-  const updateMonth = (updater) => {
-    const updated = { ...data, [currentMonth]: updater({ ...month, trips: [...month.trips] }) };
-    setData(updated);
-    save(updated);
-  };
-
   // ── Calculation ──
   const calcSummary = () => {
     const shares = {};
     partners.forEach((p) => (shares[p] = 0));
     let totalFuel = 0, totalExtraFares = 0;
-
     const oneWayFares = month.oneWayFares || {};
 
     month.trips.forEach((trip) => {
-      const { fuelCost, travelers } = trip;
-      if (!fuelCost) return;
-      const extraFare = trip.extraFare || 0;
-      totalFuel += fuelCost;
-      totalExtraFares += extraFare;
-
-      const entries = Object.entries(travelers);
-      if (!entries.length) { shares["Ahmad"] = (shares["Ahmad"] || 0) + fuelCost - extraFare; return; }
-
-      let sharedCost, personalCost;
-      if (trip.mode === "estimate") {
-        sharedCost = Math.max(0, (trip.sharedCost || 0) - extraFare);
-        personalCost = fuelCost - (trip.sharedCost || 0);
-      } else {
-        const { totalKm, sharedKm } = trip;
-        if (!totalKm) return;
-        const perKmCost = fuelCost / totalKm;
-        const effectiveSharedKm = Math.min(sharedKm, totalKm);
-        sharedCost = Math.max(0, effectiveSharedKm * perKmCost - extraFare);
-        personalCost = (totalKm - effectiveSharedKm) * perKmCost;
-      }
-
-      // One-way travelers with fixed fares: deduct their fare, rest splits among both-way
-      const oneWayEntries = entries.filter(([, m]) => m === "one");
-      const bothWayEntries = entries.filter(([, m]) => m === "both");
-      let oneWayTotal = 0;
-
-      oneWayEntries.forEach(([p]) => {
-        const fare = oneWayFares[p] || 0;
-        if (shares[p] === undefined) shares[p] = 0;
-        if (fare > 0) {
-          // Fixed fare set: use it
-          shares[p] += fare;
-          oneWayTotal += fare;
-        } else {
-          // No fixed fare: fall back to per-leg split
-          const halfCost = sharedCost / 2;
-          const goingCount = entries.length;
-          shares[p] += halfCost / goingCount;
-          oneWayTotal += halfCost / goingCount;
-        }
-      });
-
-      // Remaining shared cost goes to both-way travelers
-      const remainingShared = sharedCost - oneWayTotal;
-      if (bothWayEntries.length > 0) {
-        bothWayEntries.forEach(([p]) => {
-          if (shares[p] === undefined) shares[p] = 0;
-          shares[p] += remainingShared / bothWayEntries.length;
-        });
-      } else {
-        // No both-way travelers: remainder to Ahmad
-        if (shares["Ahmad"] === undefined) shares["Ahmad"] = 0;
-        shares["Ahmad"] += remainingShared;
-      }
-
-      // Personal cost to Ahmad
-      if (personalCost > 0) {
-        if (shares["Ahmad"] === undefined) shares["Ahmad"] = 0;
-        shares["Ahmad"] += personalCost;
-      }
+      if (!trip.fuelCost) return;
+      totalFuel += trip.fuelCost;
+      const { extraAM, extraPM } = tripExtras(trip);
+      totalExtraFares += extraAM + extraPM;
+      const s = splitTrip({ ...tripCosts(trip), travelers: trip.travelers, extraAM, extraPM, owFares: oneWayFares });
+      Object.entries(s).forEach(([p, v]) => { shares[p] = (shares[p] || 0) + v; });
     });
 
     const deposits = month.deposits || {};
@@ -368,7 +317,8 @@ function Tracker({ config, onDisconnect, t }) {
     const trip = {
       id: Date.now(), date: tripForm.date, mode: tripForm.mode,
       fuelCost: parseFloat(tripForm.fuelCost) || 0,
-      extraFare: parseFloat(tripForm.extraFare) || 0,
+      extraFareAM: parseFloat(tripForm.extraFareAM) || 0,
+      extraFarePM: parseFloat(tripForm.extraFarePM) || 0,
       travelers: Object.keys(tripForm.travelers).length > 0 ? { ...tripForm.travelers } : { Ahmad: "both" },
       ...(isEstimate
         ? { sharedCost: parseFloat(tripForm.sharedCost) || 0 }
@@ -378,7 +328,7 @@ function Tracker({ config, onDisconnect, t }) {
     if (!isEstimate && !trip.totalKm) return;
     if (isEstimate && !trip.sharedCost) return;
     updateMonth((m) => ({ ...m, trips: [...m.trips, trip].sort((a, b) => a.date.localeCompare(b.date)) }));
-    setTripForm({ mode: tripForm.mode, date: new Date().toISOString().slice(0, 10), totalKm: "", fuelCost: "", sharedKm: DEFAULT_SHARED_KM, sharedCost: "", extraFare: "", travelers: {} });
+    setTripForm({ mode: tripForm.mode, date: new Date().toISOString().slice(0, 10), totalKm: "", fuelCost: "", sharedKm: DEFAULT_SHARED_KM, sharedCost: "", extraFareAM: "", extraFarePM: "", travelers: {} });
     setView("trips");
   };
 
@@ -425,8 +375,10 @@ function Tracker({ config, onDisconnect, t }) {
     setTripForm((f) => {
       const cur = f.travelers[p];
       const nw = { ...f.travelers };
+      // Cycle: absent -> both -> morning only -> return only -> absent
       if (!cur) nw[p] = "both";
-      else if (cur === "both") nw[p] = "one";
+      else if (cur === "both") nw[p] = "morning";
+      else if (cur === "morning" || cur === "one") nw[p] = "return";
       else delete nw[p];
       return { ...f, travelers: nw };
     });
@@ -523,7 +475,7 @@ function Tracker({ config, onDisconnect, t }) {
                         {isEst && <span style={{ fontSize: 10, color: "#f59e0b", marginLeft: 6, fontWeight: 500 }}>EST</span>}
                       </span>
                       <span style={{ fontSize: 12, color: t.textSec, marginTop: 2, display: "block" }}>
-                        {te.map(([p, m]) => p + (m === "one" ? " (1-way)" : "")).join(", ")}
+                        {te.map(([p, m]) => p + MODE_TAG[normMode(m)]).join(", ")}
                       </span>
                     </div>
                     <button onClick={() => deleteTrip(trip.id)} style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 18, padding: "0 4px" }}>×</button>
@@ -533,16 +485,17 @@ function Tracker({ config, onDisconnect, t }) {
                     <span>{formatRs(trip.fuelCost)}</span>
                     {!isEst && <><span style={{ opacity: 0.4 }}>•</span><span>{formatRs(perKm)}/km</span></>}
                     {isEst && <><span style={{ opacity: 0.4 }}>•</span><span>Shared: {formatRs(sharedCost)}</span></>}
-                    {(trip.extraFare || 0) > 0 && <><span style={{ opacity: 0.4 }}>•</span><span style={{ color: "#22c55e" }}>+{formatRs(trip.extraFare)} pickup</span></>}
+                    {(() => { const { extraAM, extraPM } = tripExtras(trip); return <>
+                      {extraAM > 0 && <><span style={{ opacity: 0.4 }}>•</span><span style={{ color: "#22c55e" }}>+{formatRs(extraAM)} AM pickup</span></>}
+                      {extraPM > 0 && <><span style={{ opacity: 0.4 }}>•</span><span style={{ color: "#22c55e" }}>+{formatRs(extraPM)} PM pickup</span></>}
+                    </>; })()}
                   </div>
                   {isEst && personalCost > 0 && <div style={{ fontSize: 12, color: "#f59e0b", marginTop: 6, fontWeight: 500 }}>Personal: {formatRs(personalCost)}</div>}
                   {!isEst && personalKm > 0 && <div style={{ fontSize: 12, color: "#f59e0b", marginTop: 6, fontWeight: 500 }}>Personal: {personalKm} km ({formatRs(personalKm * perKm)})</div>}
                   <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
                     {(() => {
-                      const ef = trip.extraFare || 0;
-                      const sc = Math.max(0, (isEst ? sharedCost : sharedKm * perKm) - ef);
-                      const pc = isEst ? personalCost : (personalKm || 0) * (perKm || 0);
-                      const s = computeShares(sc, pc, te, month.oneWayFares);
+                      const { extraAM, extraPM } = tripExtras(trip);
+                      const s = splitTrip({ ...tripCosts(trip), travelers: trip.travelers, extraAM, extraPM, owFares: month.oneWayFares });
                       return te.map(([p]) => (
                         <span key={p} style={{ fontSize: 12, background: t.card, border: `1px solid ${t.border}`, borderRadius: 6, padding: "3px 8px", fontWeight: 500 }}>{p}: {formatRs(s[p] || 0)}</span>
                       ));
@@ -598,64 +551,56 @@ function Tracker({ config, onDisconnect, t }) {
               </>
             )}
 
-            <label style={lbl}>Extra Fare Collected (Rs) — optional</label>
-            <input type="number" inputMode="decimal" placeholder="e.g. 300 from pickup" value={tripForm.extraFare} onChange={(e) => setTripForm((f) => ({ ...f, extraFare: e.target.value }))} style={inp} />
-
-            <label style={lbl}>Who traveled? (tap: absent → both ways → one way)</label>
+            <label style={lbl}>Who traveled? (tap: absent → both → AM only → PM only)</label>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
               {partners.map((p) => {
-                const mode = tripForm.travelers[p];
-                const active = !!mode;
+                const mode = normMode(tripForm.travelers[p]);
+                const color = { both: "#2563eb", morning: "#f59e0b", return: "#8b5cf6" }[mode];
                 return (
                   <button key={p} onClick={() => toggleTraveler(p)} style={{
                     padding: "8px 16px", borderRadius: 20, cursor: "pointer", fontSize: 14, fontWeight: 500,
-                    border: `1px solid ${active ? (mode === "one" ? "#f59e0b" : "#2563eb") : t.borderInput}`,
-                    background: active ? (mode === "one" ? "#f59e0b" : "#2563eb") : t.bg,
-                    color: active ? "#fff" : t.text,
+                    border: `1px solid ${color || t.borderInput}`,
+                    background: color || t.bg,
+                    color: color ? "#fff" : t.text,
                   }}>
-                    {mode === "one" ? `${p} (1-way)` : p}
+                    {p}{mode ? MODE_TAG[mode] : ""}
                   </button>
                 );
               })}
             </div>
 
+            <label style={lbl}>Extra passenger fare — morning (Rs, optional)</label>
+            <input type="number" inputMode="decimal" placeholder="e.g. 400" value={tripForm.extraFareAM} onChange={(e) => setTripForm((f) => ({ ...f, extraFareAM: e.target.value }))} style={inp} />
+            <label style={lbl}>Extra passenger fare — return (Rs, optional)</label>
+            <input type="number" inputMode="decimal" placeholder="e.g. 400" value={tripForm.extraFarePM} onChange={(e) => setTripForm((f) => ({ ...f, extraFarePM: e.target.value }))} style={inp} />
+
             {/* Preview */}
-            {tripForm.fuelCost && Object.keys(tripForm.travelers).length > 0 && (() => {
-              const fc = parseFloat(tripForm.fuelCost);
-              const entries = Object.entries(tripForm.travelers);
-
-              const ef = parseFloat(tripForm.extraFare) || 0;
-
-              if (tripForm.mode === "estimate") {
-                const sc = Math.max(0, (parseFloat(tripForm.sharedCost) || 0) - ef);
-                const pc = fc - (parseFloat(tripForm.sharedCost) || 0);
-                if (!sc && !ef) return null;
-                const s = computeShares(sc, pc, entries, month.oneWayFares);
-                return (
-                  <div style={{ background: t.bg, border: `1px solid ${t.border}`, borderRadius: 8, padding: 12, marginBottom: 16 }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: t.textSec, marginBottom: 8 }}>Split Preview</div>
-                    {entries.map(([p, mode]) => (
-                      <div key={p} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "3px 0" }}><span>{p} {mode === "one" ? "(1-way)" : ""}</span><span style={{ fontWeight: 600 }}>{formatRs(s[p] || 0)}</span></div>
-                    ))}
-                    {pc > 0 && <div style={{ fontSize: 12, color: "#f59e0b", marginTop: 4 }}>Ahmad's personal: {formatRs(pc)}</div>}
-                  </div>
-                );
-              } else {
-                const tk = parseFloat(tripForm.totalKm);
-                if (!tk) return null;
-                const sk = Math.min(parseFloat(tripForm.sharedKm) || DEFAULT_SHARED_KM, tk);
-                const pk = tk - sk, perKm = fc / tk;
-                const s = computeShares(Math.max(0, sk * perKm - ef), pk * perKm, entries, month.oneWayFares);
-                return (
-                  <div style={{ background: t.bg, border: `1px solid ${t.border}`, borderRadius: 8, padding: 12, marginBottom: 16 }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: t.textSec, marginBottom: 8 }}>Split Preview</div>
-                    {entries.map(([p, mode]) => (
-                      <div key={p} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "3px 0" }}><span>{p} {mode === "one" ? "(1-way)" : ""}</span><span style={{ fontWeight: 600 }}>{formatRs(s[p] || 0)}</span></div>
-                    ))}
-                    {pk > 0 && <div style={{ fontSize: 12, color: "#f59e0b", marginTop: 4 }}>Ahmad's personal: {pk} km = {formatRs(pk * perKm)}</div>}
-                  </div>
-                );
-              }
+            {(() => {
+              const fc = parseFloat(tripForm.fuelCost) || 0;
+              if (!fc || !Object.keys(tripForm.travelers).length) return null;
+              const draft = {
+                mode: tripForm.mode, fuelCost: fc,
+                sharedCost: parseFloat(tripForm.sharedCost) || 0,
+                totalKm: parseFloat(tripForm.totalKm) || 0,
+                sharedKm: parseFloat(tripForm.sharedKm) || DEFAULT_SHARED_KM,
+              };
+              if (draft.mode === "estimate" && !draft.sharedCost) return null;
+              if (draft.mode === "exact" && !draft.totalKm) return null;
+              const costs = tripCosts(draft);
+              const extraAM = parseFloat(tripForm.extraFareAM) || 0;
+              const extraPM = parseFloat(tripForm.extraFarePM) || 0;
+              const s = splitTrip({ ...costs, travelers: tripForm.travelers, extraAM, extraPM, owFares: month.oneWayFares });
+              return (
+                <div style={{ background: t.bg, border: `1px solid ${t.border}`, borderRadius: 8, padding: 12, marginBottom: 16 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: t.textSec, marginBottom: 8 }}>Split Preview</div>
+                  {Object.entries(tripForm.travelers).map(([p, m]) => (
+                    <div key={p} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "3px 0" }}><span>{p}{MODE_TAG[normMode(m)]}</span><span style={{ fontWeight: 600 }}>{formatRs(s[p] || 0)}</span></div>
+                  ))}
+                  {extraAM > 0 && <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "3px 0", color: "#22c55e" }}><span>Extra passenger (AM)</span><span style={{ fontWeight: 600 }}>{formatRs(extraAM)}</span></div>}
+                  {extraPM > 0 && <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "3px 0", color: "#22c55e" }}><span>Extra passenger (PM)</span><span style={{ fontWeight: 600 }}>{formatRs(extraPM)}</span></div>}
+                  {costs.personalCost > 0 && <div style={{ fontSize: 12, color: "#f59e0b", marginTop: 4 }}>Includes Ahmad's personal: {formatRs(costs.personalCost)}</div>}
+                </div>
+              );
             })()}
             <button onClick={addTrip} style={S.primaryBtn}>Save Trip</button>
           </div>
@@ -683,11 +628,11 @@ function Tracker({ config, onDisconnect, t }) {
                 <input type="number" inputMode="decimal" value={setupForm.carryForward[p] || ""} onChange={(e) => setSetupForm((f) => ({ ...f, carryForward: { ...f.carryForward, [p]: parseFloat(e.target.value) || 0 } }))} style={inp} />
               </div>
             ))}
-            <h3 style={{ fontSize: 15, fontWeight: 700, marginTop: 16, marginBottom: 8 }}>One-Way Fixed Fares</h3>
-            <p style={{ fontSize: 13, color: t.textSec, marginBottom: 12 }}>Fixed amount each partner pays when marked one-way. Leave 0 to auto-calculate per-leg split.</p>
+            <h3 style={{ fontSize: 15, fontWeight: 700, marginTop: 16, marginBottom: 8 }}>Single-Leg Fixed Fares</h3>
+            <p style={{ fontSize: 13, color: t.textSec, marginBottom: 12 }}>Fixed amount a partner pays when they ride only one leg (AM only or PM only). Leave 0 to split that leg equally.</p>
             {partners.filter((p) => p !== "Ahmad").map((p) => (
               <div key={p} style={{ marginBottom: 10 }}>
-                <label style={lbl}>{p}'s One-Way Fare (Rs)</label>
+                <label style={lbl}>{p}'s Single-Leg Fare (Rs)</label>
                 <input type="number" inputMode="decimal" placeholder="e.g. 500" value={setupForm.oneWayFares[p] || ""} onChange={(e) => setSetupForm((f) => ({ ...f, oneWayFares: { ...f.oneWayFares, [p]: parseFloat(e.target.value) || 0 } }))} style={inp} />
               </div>
             ))}
