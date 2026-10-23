@@ -275,6 +275,12 @@ function Tracker({ config, onDisconnect, t }) {
     oneWayFares: hasFares ? rawMonth.oneWayFares : inherited.fares,
   };
 
+  const updateMonth = (updater) => {
+    const updated = { ...data, [currentMonth]: updater({ ...month, trips: [...month.trips] }) };
+    setData(updated);
+    save(updated);
+  };
+
   // ── Calculation ──
   const calcSummary = () => {
     const shares = {};
