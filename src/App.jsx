@@ -257,22 +257,23 @@ function Tracker({ config, onDisconnect, t }) {
     </div>
   );
 
-  // Carry over pre-existing balance and one-way fares from the latest earlier month if not set
+  // Carry over pre-existing balance and one-way fares from the latest earlier month
+  // ONLY when this month has no value at all. An explicit 0 / cleared fares are real values and are kept.
+  const isSet = (v) => v !== undefined && v !== null;
   const inherited = (() => {
     const keys = Object.keys(data || {}).filter((k) => k < currentMonth).sort().reverse();
     let bal = 0, fares = {};
-    for (const k of keys) { if (data[k]?.preExistingBalance) { bal = data[k].preExistingBalance; break; } }
-    for (const k of keys) { if (data[k]?.oneWayFares && Object.values(data[k].oneWayFares).some((v) => v > 0)) { fares = data[k].oneWayFares; break; } }
+    for (const k of keys) { if (isSet(data[k]?.preExistingBalance)) { bal = data[k].preExistingBalance; break; } }
+    for (const k of keys) { if (isSet(data[k]?.oneWayFares)) { fares = data[k].oneWayFares; break; } }
     return { bal, fares };
   })();
   const rawMonth = data?.[currentMonth] || {};
-  const hasFares = rawMonth.oneWayFares && Object.values(rawMonth.oneWayFares).some((v) => v > 0);
   const month = {
     ...emptyMonth(),
     ...rawMonth,
     trips: rawMonth.trips || [],
-    preExistingBalance: rawMonth.preExistingBalance || inherited.bal,
-    oneWayFares: hasFares ? rawMonth.oneWayFares : inherited.fares,
+    preExistingBalance: isSet(rawMonth.preExistingBalance) ? rawMonth.preExistingBalance : inherited.bal,
+    oneWayFares: isSet(rawMonth.oneWayFares) ? rawMonth.oneWayFares : inherited.fares,
   };
 
   const updateMonth = (updater) => {
